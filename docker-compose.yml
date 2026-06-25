@@ -1,7 +1,5 @@
 # Integration 10 — four-service stack.
 #
-# TODO (Infra-Integration lead): author this file.
-#
 # Required services: api, web, neo4j, weaviate.
 #
 # Per the Evaluation Methodology in integration-task-spec.md:
@@ -28,6 +26,78 @@
 #             /v1/.well-known/ready.
 # - volumes block declares named neo4j_data and weaviate_data.
 
-services: {}
+services:
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      weaviate:
+        condition: service_healthy
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      WEAVIATE_URL: http://weaviate:8080
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
-volumes: {}
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_dbms_memory_heap_max__size: 1G
+      NEO4J_dbms_memory_pagecache_size: 512M
+    ports:
+      - "7687:7687"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  weaviate:
+    image: semitechnologies/weaviate:1.24.10
+    environment:
+      DEFAULT_VECTORIZER_MODULE: none
+    ports:
+      - "8080:8080"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  neo4j_data:
+  weaviate_data:
