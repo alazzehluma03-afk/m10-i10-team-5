@@ -1,6 +1,23 @@
 // TypeScript interfaces — must mirror api/models.py exactly.
 // snake_case field names preserved (chunk_id, not chunkId).
 
+// --- Request types ---
+
+export interface ExtractRequest {
+  text: string;
+}
+
+export interface KGQueryRequest {
+  question: string;
+}
+
+export interface RAGRequest {
+  question: string;
+  k?: number;
+}
+
+// --- Response types ---
+
 export interface Entity {
   text: string;
   label: string;

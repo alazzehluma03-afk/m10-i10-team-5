@@ -72,3 +72,8 @@ class HealthResponse(BaseModel):
 class ReadyDetail(BaseModel):
     neo4j: str
     weaviate: str
+
+class ServiceUnavailableDetail(BaseModel):
+    service: str
+    status: str
+    message: str

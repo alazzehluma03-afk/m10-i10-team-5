@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir --timeout 300 --retries 5 \
     https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 
 # Copy application code last so code changes don't invalidate dependency layers.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 COPY api/ /app/api/
 
 EXPOSE 8000
