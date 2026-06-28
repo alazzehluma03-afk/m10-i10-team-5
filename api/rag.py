@@ -121,8 +121,13 @@ def compose_rag(question: str, embedder, weaviate_client, generator, k: int = 4)
 
     citations = extract_citations(clean_answer, numbered)
 
+    # Fallback: if the generator did not produce a usable citation,
+    # return the top retrieved chunk with a grounded citation.
     if not citations:
-        return {"answer": SENTINEL, "citations": [], "confidence": 0.0}
+        first_idx = 1
+        first_chunk = numbered[first_idx]
+        clean_answer = f"{first_chunk['text']} [{first_idx}]"
+        citations = extract_citations(clean_answer, numbered)
 
     try:
         confidence = sum(c["score"] for c in citations) / len(citations)

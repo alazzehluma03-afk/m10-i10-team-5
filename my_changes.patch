@@ -1,0 +1,2253 @@
+diff --git a/api/Dockerfile b/api/Dockerfile
+index 7f8b99f..07bb022 100644
+--- a/api/Dockerfile
++++ b/api/Dockerfile
+@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir --timeout 300 --retries 5 \
+     https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+ 
+ # Copy application code last so code changes don't invalidate dependency layers.
++RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+ COPY api/ /app/api/
+ 
+ EXPOSE 8000
+diff --git a/api/models.py b/api/models.py
+index 8b0530a..e8fab2d 100644
+--- a/api/models.py
++++ b/api/models.py
+@@ -72,3 +72,8 @@ class HealthResponse(BaseModel):
+ class ReadyDetail(BaseModel):
+     neo4j: str
+     weaviate: str
++
++class ServiceUnavailableDetail(BaseModel):
++    service: str
++    status: str
++    message: str
+\ No newline at end of file
+diff --git a/api/rag.py b/api/rag.py
+index 1fde660..b60ecb3 100644
+--- a/api/rag.py
++++ b/api/rag.py
+@@ -3,16 +3,6 @@
+ Grounding contract: when `answer` is not the empty-retrieval sentinel,
+ `len(citations) > 0` is required. Every cited `chunk_id` corresponds to
+ a chunk in the top-`k` retrieved from Weaviate.
+-
+-Generator called with `do_sample=False` for reproducibility.
+-
+-Integration hardening (Integration 10):
+-- Generator call is bounded by GENERATOR_TIMEOUT_SECONDS (default 30s,
+-  overridable via RAG_GENERATOR_TIMEOUT_SECONDS env var) so a hung
+-  flan-t5-base inference cannot block a request thread indefinitely.
+-- Validates retrieval results and citation extraction.
+-- Comprehensive error handling with typed exceptions.
+-- Raises GenerationTimeoutError on timeout, which main.py maps to 503.
+ """
+ import os
+ import re
+@@ -21,6 +11,7 @@ from typing import Tuple
+ 
+ PROMPT_TEMPLATE = """\
+ You are answering a recipe question. Use ONLY the numbered sources below.
++Write a helpful answer in one or two sentences.
+ Cite each claim with the source number in square brackets, e.g. [1].
+ If the sources do not contain the answer, say: I cannot answer this from the available sources.
+ 
+@@ -34,8 +25,6 @@ SENTINEL = "I cannot answer this from the available sources"
+ CITATION_PATTERN = re.compile(r"\[(\d+)\]")
+ GENERATOR_TIMEOUT_SECONDS = float(os.environ.get("RAG_GENERATOR_TIMEOUT_SECONDS", "30"))
+ 
+-# One worker thread reused across calls to bound the generator without
+-# spinning up a new thread per request.
+ _generator_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-generator")
+ 
+ 
+@@ -44,58 +33,32 @@ class GenerationTimeoutError(Exception):
+ 
+ 
+ def assemble_prompt(question: str, chunks: list[dict]) -> Tuple[str, dict[int, dict]]:
+-    """Number the retrieved chunks 1..k and substitute into the prompt template.
+-
+-    Returns (prompt_str, {citation_index: chunk_dict}). Index starts at 1.
+-    """
+     numbered: dict[int, dict] = {}
+     lines = []
++
+     for i, chunk in enumerate(chunks, start=1):
+         numbered[i] = chunk
+         lines.append(f"[{i}] {chunk['text']}")
++
+     sources = "\n".join(lines)
+     return PROMPT_TEMPLATE.format(sources=sources, question=question), numbered
+ 
+ 
+ def extract_citations(answer: str, numbered: dict[int, dict]) -> list[dict]:
+-    """Pull [N]-style markers from `answer` and resolve to retrieved chunks.
+-
+-    Returns one {"chunk_id", "score"} dict per unique resolvable index.
+-    """
+     cited: list[dict] = []
+     seen: set[int] = set()
++
+     for match in CITATION_PATTERN.finditer(answer):
+         idx = int(match.group(1))
+         if idx in numbered and idx not in seen:
+             seen.add(idx)
+             chunk = numbered[idx]
+             cited.append({"chunk_id": chunk["chunk_id"], "score": chunk["score"]})
++
+     return cited
+ 
+ 
+ def compose_rag(question: str, embedder, weaviate_client, generator, k: int = 4) -> dict:
+-    """Run the four-stage RAG pipeline.
+-
+-    Encodes the question via the externally-loaded sentence-transformers
+-    embedder and queries Weaviate with `with_near_vector`. The Weaviate
+-    class is `vectorizer=none`, so `with_near_text` would fail at
+-    runtime with `KeyError: 'data'`.
+-
+-    Args:
+-        question: The user's question.
+-        embedder: sentence-transformers model instance.
+-        weaviate_client: Weaviate client.
+-        generator: HuggingFace text-generation pipeline.
+-        k: Top-k chunks to retrieve.
+-
+-    Returns:
+-        {"answer": str, "citations": list[dict], "confidence": float}
+-
+-    Raises:
+-        GenerationTimeoutError: If generation exceeds timeout.
+-        RuntimeError: If retrieval, encoding, or parsing fails.
+-    """
+-    # Stage 1: Encode question and retrieve chunks.
+     try:
+         vector = embedder.encode(question).tolist()
+     except Exception as e:
+@@ -112,7 +75,6 @@ def compose_rag(question: str, embedder, weaviate_client, generator, k: int = 4)
+     except Exception as e:
+         raise RuntimeError(f"Weaviate retrieval failed: {e.__class__.__name__}: {str(e)}") from e
+ 
+-    # Parse and validate retrieval response.
+     try:
+         retrieved = [
+             {
+@@ -131,12 +93,15 @@ def compose_rag(question: str, embedder, weaviate_client, generator, k: int = 4)
+     if not all(isinstance(c.get("chunk_id"), int) and isinstance(c.get("text"), str) for c in retrieved):
+         raise RuntimeError("Invalid chunk data structure in retrieval results")
+ 
+-    # Stage 2: Assemble prompt and generate answer.
+     prompt, numbered = assemble_prompt(question, retrieved)
+ 
+     future = _generator_executor.submit(
+-        generator, prompt, max_new_tokens=256, do_sample=False
++        generator,
++        prompt,
++        max_new_tokens=256,
++        do_sample=False,
+     )
++
+     try:
+         raw = future.result(timeout=GENERATOR_TIMEOUT_SECONDS)[0]["generated_text"]
+     except FutureTimeoutError:
+@@ -146,8 +111,16 @@ def compose_rag(question: str, embedder, weaviate_client, generator, k: int = 4)
+     except (KeyError, IndexError, TypeError) as e:
+         raise RuntimeError(f"Malformed generator response: {e.__class__.__name__}") from e
+ 
+-    # Stage 3: Extract citations and compute confidence.
+-    citations = extract_citations(raw, numbered)
++    clean_answer = raw.strip()
++
++    citation_only = re.fullmatch(r"\s*\[(\d+)\]\.?\s*", clean_answer)
++    if citation_only:
++        idx = int(citation_only.group(1))
++        if idx in numbered:
++            clean_answer = f"{numbered[idx]['text']} [{idx}]"
++
++    citations = extract_citations(clean_answer, numbered)
++
+     if not citations:
+         return {"answer": SENTINEL, "citations": [], "confidence": 0.0}
+ 
+@@ -157,4 +130,8 @@ def compose_rag(question: str, embedder, weaviate_client, generator, k: int = 4)
+     except (KeyError, ZeroDivisionError, TypeError) as e:
+         raise RuntimeError(f"Citation aggregation failed: {e.__class__.__name__}") from e
+ 
+-    return {"answer": raw, "citations": citations, "confidence": confidence}
++    return {
++        "answer": clean_answer,
++        "citations": citations,
++        "confidence": confidence,
++    }
+\ No newline at end of file
+diff --git a/tests/frontend/playwright/extract.spec.ts b/tests/frontend/playwright/extract.spec.ts
+index 817ecd4..a58e2fe 100644
+--- a/tests/frontend/playwright/extract.spec.ts
++++ b/tests/frontend/playwright/extract.spec.ts
+@@ -1,8 +1,30 @@
+-// Frontend lead — author this Playwright smoke test.
+-// Verifies the /extract page renders, accepts input, and displays
+-// typed entity results from the api service.
+-import { test, expect } from '@playwright/test';
++import { test, expect } from "@playwright/test";
+ 
+-test.skip('extract page renders and returns entities', async ({ page }) => {
+-  // TODO (Frontend lead): implement against the running stack.
++const BASE = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000";
++
++test("extract page loads with form", async ({ page }) => {
++  await page.goto(`${BASE}/extract`);
++  await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
++  await expect(page.locator("textarea")).toBeVisible();
++  await expect(page.getByRole("button", { name: /extract/i })).toBeVisible();
++});
++
++test("extract submit button is disabled when textarea is empty", async ({ page }) => {
++  await page.goto(`${BASE}/extract`);
++  await expect(page.getByRole("button", { name: /extract/i })).toBeDisabled();
++});
++
++test("extract renders entity spans for a known input", async ({ page }) => {
++  await page.goto(`${BASE}/extract`);
++  await page.locator("textarea").fill("Akira Kurosawa directed Seven Samurai in 1954.");
++  await page.getByRole("button", { name: /extract/i }).click();
++  await expect(page.locator('[data-testid="entity-span"]').first()).toBeVisible({ timeout: 10_000 });
++});
++
++test("extract shows error for an aborted request", async ({ page }) => {
++  await page.route("**/extract", (route) => route.abort());
++  await page.goto(`${BASE}/extract`);
++  await page.locator("textarea").fill("Some test text with entities.");
++  await page.getByRole("button", { name: /extract/i }).click();
++  await expect(page.locator('[data-testid="error"]')).toBeVisible({ timeout: 10_000 });
+ });
+diff --git a/tests/frontend/playwright/kg.spec.ts b/tests/frontend/playwright/kg.spec.ts
+index 445fa63..b6a84cb 100644
+--- a/tests/frontend/playwright/kg.spec.ts
++++ b/tests/frontend/playwright/kg.spec.ts
+@@ -1,5 +1,38 @@
+-import { test, expect } from '@playwright/test';
++import { test, expect } from "@playwright/test";
+ 
+-test.skip('kg page renders and returns rows', async ({ page }) => {
+-  // TODO (Frontend lead): implement against the running stack.
++const BASE = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000";
++
++test("kg page loads with form", async ({ page }) => {
++  await page.goto(`${BASE}/kg`);
++  await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
++  await expect(page.locator("input")).toBeVisible();
++  await expect(page.getByRole("button", { name: /ask/i })).toBeVisible();
++});
++
++test("kg submit button is disabled when input is empty", async ({ page }) => {
++  await page.goto(`${BASE}/kg`);
++  await expect(page.getByRole("button", { name: /ask/i })).toBeDisabled();
++});
++
++test("kg renders rows for a seeded question", async ({ page }) => {
++  await page.goto(`${BASE}/kg`);
++  await page.locator("input").fill("Find Sichuan recipes");
++  await page.getByRole("button", { name: /ask/i }).click();
++  await expect(page.locator('[data-testid="kg-row"]').first()).toBeVisible({ timeout: 10_000 });
++});
++
++test("kg shows supported patterns on unsupported question", async ({ page }) => {
++  await page.goto(`${BASE}/kg`);
++  await page.locator("input").fill("Who invented spaghetti?");
++  await page.getByRole("button", { name: /ask/i }).click();
++  await expect(page.locator('[data-testid="error"]')).toBeVisible({ timeout: 10_000 });
++  await expect(page.locator('[data-testid="supported-patterns"]')).toBeVisible({ timeout: 10_000 });
++});
++
++test("kg shows error for an aborted request", async ({ page }) => {
++  await page.route("**/kg/query", (route) => route.abort());
++  await page.goto(`${BASE}/kg`);
++  await page.locator("input").fill("Find Italian recipes");
++  await page.getByRole("button", { name: /ask/i }).click();
++  await expect(page.locator('[data-testid="error"]')).toBeVisible({ timeout: 10_000 });
+ });
+diff --git a/tests/frontend/playwright/rag.spec.ts b/tests/frontend/playwright/rag.spec.ts
+index 852a44c..453fe24 100644
+--- a/tests/frontend/playwright/rag.spec.ts
++++ b/tests/frontend/playwright/rag.spec.ts
+@@ -1,6 +1,42 @@
+-import { test, expect } from '@playwright/test';
++import { test, expect } from "@playwright/test";
+ 
+-test.skip('rag page renders cited answer', async ({ page }) => {
+-  // TODO (Frontend lead): implement against the running stack;
+-  // verify [N]-style citation markers render in the response.
++const BASE = process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000";
++
++test("rag page loads and shows form", async ({ page }) => {
++  await page.goto(`${BASE}/rag`);
++  await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
++  await expect(page.locator("input[aria-label]")).toBeVisible();
++  await expect(page.getByRole("button", { name: /ask/i })).toBeVisible();
++});
++
++test("rag submit button is disabled when input is empty", async ({ page }) => {
++  await page.goto(`${BASE}/rag`);
++  const btn = page.getByRole("button", { name: /ask/i });
++  await expect(btn).toBeDisabled();
++});
++
++test("rag shows cited answer and citation markers after submit", async ({ page }) => {
++  await page.goto(`${BASE}/rag`);
++  await page.locator("input").fill("How do I prep ginger for stir-fry?");
++  await page.getByRole("button", { name: /ask/i }).click();
++  await expect(page.locator('[data-testid="rag-answer"]')).toBeVisible({ timeout: 30_000 });
++  await expect(page.locator('[data-testid="citation-marker"]').first()).toBeVisible({ timeout: 30_000 });
++});
++
++test("rag citation badges are clickable and expand detail", async ({ page }) => {
++  await page.goto(`${BASE}/rag`);
++  await page.locator("input").fill("What spices go in Sichuan cooking?");
++  await page.getByRole("button", { name: /ask/i }).click();
++  await expect(page.locator('[data-testid="citation-marker"]').first()).toBeVisible({ timeout: 30_000 });
++  await page.locator('[data-testid="citation-marker"]').first().click();
++  await expect(page.getByRole("tooltip")).toBeVisible();
++});
++
++test("rag shows error message on network failure", async ({ page }) => {
++  // Point to an unreachable backend to trigger a network error
++  await page.route("**/rag/answer", (route) => route.abort());
++  await page.goto(`${BASE}/rag`);
++  await page.locator("input").fill("test question");
++  await page.getByRole("button", { name: /ask/i }).click();
++  await expect(page.locator('[data-testid="error"]')).toBeVisible({ timeout: 10_000 });
+ });
+diff --git a/web/lib/types.ts b/web/lib/types.ts
+index 055a9e8..e607d46 100644
+--- a/web/lib/types.ts
++++ b/web/lib/types.ts
+@@ -1,6 +1,23 @@
+ // TypeScript interfaces — must mirror api/models.py exactly.
+ // snake_case field names preserved (chunk_id, not chunkId).
+ 
++// --- Request types ---
++
++export interface ExtractRequest {
++  text: string;
++}
++
++export interface KGQueryRequest {
++  question: string;
++}
++
++export interface RAGRequest {
++  question: string;
++  k?: number;
++}
++
++// --- Response types ---
++
+ export interface Entity {
+   text: string;
+   label: string;
+diff --git a/web/package-lock.json b/web/package-lock.json
+index fcf7004..6dfb93d 100644
+--- a/web/package-lock.json
++++ b/web/package-lock.json
+@@ -17,11 +17,26 @@
+         "@types/node": "20.11.30",
+         "@types/react": "18.2.67",
+         "@types/react-dom": "18.2.22",
++        "autoprefixer": "^10.5.2",
+         "eslint": "8.57.0",
+         "eslint-config-next": "14.1.4",
++        "tailwindcss": "^3.4.19",
+         "typescript": "5.4.3"
+       }
+     },
++    "node_modules/@alloc/quick-lru": {
++      "version": "5.2.0",
++      "resolved": "https://registry.npmjs.org/@alloc/quick-lru/-/quick-lru-5.2.0.tgz",
++      "integrity": "sha512-UrcABB+4bUrFABwbluTIBErXwvbsU/V7TZWfmbgJfbkwiBuziS9gxdODUyuiecfdGQ85jglMW6juS3+z5TsKLw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=10"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/sindresorhus"
++      }
++    },
+     "node_modules/@emnapi/core": {
+       "version": "1.10.0",
+       "resolved": "https://registry.npmjs.org/@emnapi/core/-/core-1.10.0.tgz",
+@@ -204,6 +219,45 @@
+         "url": "https://github.com/chalk/strip-ansi?sponsor=1"
+       }
+     },
++    "node_modules/@jridgewell/gen-mapping": {
++      "version": "0.3.13",
++      "resolved": "https://registry.npmjs.org/@jridgewell/gen-mapping/-/gen-mapping-0.3.13.tgz",
++      "integrity": "sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/sourcemap-codec": "^1.5.0",
++        "@jridgewell/trace-mapping": "^0.3.24"
++      }
++    },
++    "node_modules/@jridgewell/resolve-uri": {
++      "version": "3.1.2",
++      "resolved": "https://registry.npmjs.org/@jridgewell/resolve-uri/-/resolve-uri-3.1.2.tgz",
++      "integrity": "sha512-bRISgCIjP20/tbWSPWMEi54QVPRZExkuD9lJL+UIxUKtwVJA8wW1Trb1jMs1RFXo1CBTNZ/5hpC9QvmKWdopKw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/@jridgewell/sourcemap-codec": {
++      "version": "1.5.5",
++      "resolved": "https://registry.npmjs.org/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.5.5.tgz",
++      "integrity": "sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/@jridgewell/trace-mapping": {
++      "version": "0.3.31",
++      "resolved": "https://registry.npmjs.org/@jridgewell/trace-mapping/-/trace-mapping-0.3.31.tgz",
++      "integrity": "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/resolve-uri": "^3.1.0",
++        "@jridgewell/sourcemap-codec": "^1.4.14"
++      }
++    },
+     "node_modules/@napi-rs/wasm-runtime": {
+       "version": "1.1.5",
+       "resolved": "https://registry.npmjs.org/@napi-rs/wasm-runtime/-/wasm-runtime-1.1.5.tgz",
+@@ -1066,6 +1120,34 @@
+         "url": "https://github.com/chalk/ansi-styles?sponsor=1"
+       }
+     },
++    "node_modules/any-promise": {
++      "version": "1.3.0",
++      "resolved": "https://registry.npmjs.org/any-promise/-/any-promise-1.3.0.tgz",
++      "integrity": "sha512-7UvmKalWRt1wgjL1RrGxoSJW/0QZFIegpeGvZG9kjp8vrRu55XTHbwnqq2GpXm9uLbcuhxm3IqX9OB4MZR1b2A==",
++      "dev": true,
++      "license": "MIT"
++    },
++    "node_modules/anymatch": {
++      "version": "3.1.3",
++      "resolved": "https://registry.npmjs.org/anymatch/-/anymatch-3.1.3.tgz",
++      "integrity": "sha512-KMReFUr0B4t+D+OBkjR3KYqvocp2XaSzO55UcB6mgQMd3KbcE+mWTyvVV7D/zsdEbNnV6acZUutkiHQXvTr1Rw==",
++      "dev": true,
++      "license": "ISC",
++      "dependencies": {
++        "normalize-path": "^3.0.0",
++        "picomatch": "^2.0.4"
++      },
++      "engines": {
++        "node": ">= 8"
++      }
++    },
++    "node_modules/arg": {
++      "version": "5.0.2",
++      "resolved": "https://registry.npmjs.org/arg/-/arg-5.0.2.tgz",
++      "integrity": "sha512-PYjyFOLKQ9y57JvQ6QLo8dAgNqswh8M1RMJYdQduT6xbWSgK36P/Z/v+p888pM69jMMfS8Xd8F6I1kQ/I9HUGg==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/argparse": {
+       "version": "2.0.1",
+       "resolved": "https://registry.npmjs.org/argparse/-/argparse-2.0.1.tgz",
+@@ -1270,6 +1352,43 @@
+         "node": ">= 0.4"
+       }
+     },
++    "node_modules/autoprefixer": {
++      "version": "10.5.2",
++      "resolved": "https://registry.npmjs.org/autoprefixer/-/autoprefixer-10.5.2.tgz",
++      "integrity": "sha512-rD5t5DwOjJdmSORcTq64j8MawTC+tbQ+HHqjR4NDumamy/ambn1UJrlKL+KdwujWxMkFjPM3pPHOEA9tl4767Q==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/autoprefixer"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "browserslist": "^4.28.4",
++        "caniuse-lite": "^1.0.30001799",
++        "fraction.js": "^5.3.4",
++        "picocolors": "^1.1.1",
++        "postcss-value-parser": "^4.2.0"
++      },
++      "bin": {
++        "autoprefixer": "bin/autoprefixer"
++      },
++      "engines": {
++        "node": "^10 || ^12 || >=14"
++      },
++      "peerDependencies": {
++        "postcss": "^8.1.0"
++      }
++    },
+     "node_modules/available-typed-arrays": {
+       "version": "1.0.7",
+       "resolved": "https://registry.npmjs.org/available-typed-arrays/-/available-typed-arrays-1.0.7.tgz",
+@@ -1313,6 +1432,32 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/baseline-browser-mapping": {
++      "version": "2.10.40",
++      "resolved": "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.10.40.tgz",
++      "integrity": "sha512-BSSLZ9/Cjjv7Gtj5B68ZzXcXUg8iOf3fme+FCuh8rC/Go+Kmh8cox7M3A8dolou16s64QjLPOSdngh7GxXvkSw==",
++      "dev": true,
++      "license": "Apache-2.0",
++      "bin": {
++        "baseline-browser-mapping": "dist/cli.cjs"
++      },
++      "engines": {
++        "node": ">=6.0.0"
++      }
++    },
++    "node_modules/binary-extensions": {
++      "version": "2.3.0",
++      "resolved": "https://registry.npmjs.org/binary-extensions/-/binary-extensions-2.3.0.tgz",
++      "integrity": "sha512-Ceh+7ox5qe7LJuLHoY0feh3pHuUDHAcRUeyL2VYghZwfpkNIy/+8Ocg0a3UuSoYzavmylwuLWQOf3hl0jjMMIw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=8"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/sindresorhus"
++      }
++    },
+     "node_modules/brace-expansion": {
+       "version": "1.1.15",
+       "resolved": "https://registry.npmjs.org/brace-expansion/-/brace-expansion-1.1.15.tgz",
+@@ -1337,6 +1482,40 @@
+         "node": ">=8"
+       }
+     },
++    "node_modules/browserslist": {
++      "version": "4.28.4",
++      "resolved": "https://registry.npmjs.org/browserslist/-/browserslist-4.28.4.tgz",
++      "integrity": "sha512-MTc8i/x9jBQd1iMw2CFGS+rwMa07eYjLR0CCTLDACl9xhxy+nIs3KeML/biicXtk9JrZ6dnnTatmc7ErPXIxqw==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/browserslist"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/browserslist"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "baseline-browser-mapping": "^2.10.38",
++        "caniuse-lite": "^1.0.30001799",
++        "electron-to-chromium": "^1.5.376",
++        "node-releases": "^2.0.48",
++        "update-browserslist-db": "^1.2.3"
++      },
++      "bin": {
++        "browserslist": "cli.js"
++      },
++      "engines": {
++        "node": "^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7"
++      }
++    },
+     "node_modules/busboy": {
+       "version": "1.6.0",
+       "resolved": "https://registry.npmjs.org/busboy/-/busboy-1.6.0.tgz",
+@@ -1408,6 +1587,16 @@
+         "node": ">=6"
+       }
+     },
++    "node_modules/camelcase-css": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/camelcase-css/-/camelcase-css-2.0.1.tgz",
++      "integrity": "sha512-QOSvevhslijgYwRx6Rv7zKdMF8lbRmx+uQGx2+vDc+KI/eBnsy9kit5aj23AgGu3pa4t9AgwbnXWqS+iOY+2aA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">= 6"
++      }
++    },
+     "node_modules/caniuse-lite": {
+       "version": "1.0.30001799",
+       "resolved": "https://registry.npmjs.org/caniuse-lite/-/caniuse-lite-1.0.30001799.tgz",
+@@ -1445,6 +1634,44 @@
+         "url": "https://github.com/chalk/chalk?sponsor=1"
+       }
+     },
++    "node_modules/chokidar": {
++      "version": "3.6.0",
++      "resolved": "https://registry.npmjs.org/chokidar/-/chokidar-3.6.0.tgz",
++      "integrity": "sha512-7VT13fmjotKpGipCW9JEQAusEPE+Ei8nl6/g4FBAmIm0GOOLMua9NDDo/DWp0ZAxCr3cPq5ZpBqmPAQgDda2Pw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "anymatch": "~3.1.2",
++        "braces": "~3.0.2",
++        "glob-parent": "~5.1.2",
++        "is-binary-path": "~2.1.0",
++        "is-glob": "~4.0.1",
++        "normalize-path": "~3.0.0",
++        "readdirp": "~3.6.0"
++      },
++      "engines": {
++        "node": ">= 8.10.0"
++      },
++      "funding": {
++        "url": "https://paulmillr.com/funding/"
++      },
++      "optionalDependencies": {
++        "fsevents": "~2.3.2"
++      }
++    },
++    "node_modules/chokidar/node_modules/glob-parent": {
++      "version": "5.1.2",
++      "resolved": "https://registry.npmjs.org/glob-parent/-/glob-parent-5.1.2.tgz",
++      "integrity": "sha512-AOIgSQCepiJYwP3ARnGx+5VnTu2HBYdzbGP45eLw1vr3zB3vZLeyed1sC9hnbcOc9/SrMyM5RPQrkGz4aS9Zow==",
++      "dev": true,
++      "license": "ISC",
++      "dependencies": {
++        "is-glob": "^4.0.1"
++      },
++      "engines": {
++        "node": ">= 6"
++      }
++    },
+     "node_modules/client-only": {
+       "version": "0.0.1",
+       "resolved": "https://registry.npmjs.org/client-only/-/client-only-0.0.1.tgz",
+@@ -1471,6 +1698,16 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/commander": {
++      "version": "4.1.1",
++      "resolved": "https://registry.npmjs.org/commander/-/commander-4.1.1.tgz",
++      "integrity": "sha512-NOKm8xhkzAjzFx8B2v5OAHT+u5pRQc2UCa2Vq9jYL/31o2wi9mxBA7LIFs3sV5VSC49z6pEhfbMULvShKj26WA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">= 6"
++      }
++    },
+     "node_modules/concat-map": {
+       "version": "0.0.1",
+       "resolved": "https://registry.npmjs.org/concat-map/-/concat-map-0.0.1.tgz",
+@@ -1493,6 +1730,19 @@
+         "node": ">= 8"
+       }
+     },
++    "node_modules/cssesc": {
++      "version": "3.0.0",
++      "resolved": "https://registry.npmjs.org/cssesc/-/cssesc-3.0.0.tgz",
++      "integrity": "sha512-/Tb/JcjK111nNScGob5MNtsntNM1aCNUDipB/TkwZFhyDrrE47SOx/18wF2bbjgc3ZzCSKW1T5nt5EbFoAz/Vg==",
++      "dev": true,
++      "license": "MIT",
++      "bin": {
++        "cssesc": "bin/cssesc"
++      },
++      "engines": {
++        "node": ">=4"
++      }
++    },
+     "node_modules/csstype": {
+       "version": "3.2.3",
+       "resolved": "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz",
+@@ -1622,6 +1872,13 @@
+         "url": "https://github.com/sponsors/ljharb"
+       }
+     },
++    "node_modules/didyoumean": {
++      "version": "1.2.2",
++      "resolved": "https://registry.npmjs.org/didyoumean/-/didyoumean-1.2.2.tgz",
++      "integrity": "sha512-gxtyfqMg7GKyhQmb056K7M3xszy/myH8w+B4RT+QXBQsvAOdc3XymqDDPHx1BgPgsdAA5SIifona89YtRATDzw==",
++      "dev": true,
++      "license": "Apache-2.0"
++    },
+     "node_modules/dir-glob": {
+       "version": "3.0.1",
+       "resolved": "https://registry.npmjs.org/dir-glob/-/dir-glob-3.0.1.tgz",
+@@ -1635,6 +1892,13 @@
+         "node": ">=8"
+       }
+     },
++    "node_modules/dlv": {
++      "version": "1.1.3",
++      "resolved": "https://registry.npmjs.org/dlv/-/dlv-1.1.3.tgz",
++      "integrity": "sha512-+HlytyjlPKnIG8XuRG8WvmBP8xs8P71y+SKKS6ZXWoEgLuePxtDoUEiH7WkdePWrQ5JBpE6aoVqfZfJUQkjXwA==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/doctrine": {
+       "version": "3.0.0",
+       "resolved": "https://registry.npmjs.org/doctrine/-/doctrine-3.0.0.tgz",
+@@ -1670,6 +1934,13 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/electron-to-chromium": {
++      "version": "1.5.379",
++      "resolved": "https://registry.npmjs.org/electron-to-chromium/-/electron-to-chromium-1.5.379.tgz",
++      "integrity": "sha512-v/qV5aV5EUA2pGilzUCq5/eyOloZAqDZBu9UMBIzgPpLlprjSR6zswsWBTv0KpqxLGUAZEwhO95ZCt7srymNVA==",
++      "dev": true,
++      "license": "ISC"
++    },
+     "node_modules/emoji-regex": {
+       "version": "9.2.2",
+       "resolved": "https://registry.npmjs.org/emoji-regex/-/emoji-regex-9.2.2.tgz",
+@@ -1854,6 +2125,16 @@
+         "url": "https://github.com/sponsors/ljharb"
+       }
+     },
++    "node_modules/escalade": {
++      "version": "3.2.0",
++      "resolved": "https://registry.npmjs.org/escalade/-/escalade-3.2.0.tgz",
++      "integrity": "sha512-WUj2qlxaQtO4g6Pq5c29GTcWGDyd8itL8zTlipgECz3JesAiiOKotd8JU6otB3PACgG6xkJUyVhboMS+bje/jA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=6"
++      }
++    },
+     "node_modules/escape-string-regexp": {
+       "version": "4.0.0",
+       "resolved": "https://registry.npmjs.org/escape-string-regexp/-/escape-string-regexp-4.0.0.tgz",
+@@ -2455,6 +2736,20 @@
+         "url": "https://github.com/sponsors/isaacs"
+       }
+     },
++    "node_modules/fraction.js": {
++      "version": "5.3.4",
++      "resolved": "https://registry.npmjs.org/fraction.js/-/fraction.js-5.3.4.tgz",
++      "integrity": "sha512-1X1NTtiJphryn/uLQz3whtY6jK3fTqoE3ohKs0tT+Ujr1W59oopxmoEh7Lu5p6vBaPbgoM0bzveAW4Qi5RyWDQ==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": "*"
++      },
++      "funding": {
++        "type": "github",
++        "url": "https://github.com/sponsors/rawify"
++      }
++    },
+     "node_modules/fs.realpath": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/fs.realpath/-/fs.realpath-1.0.0.tgz",
+@@ -2963,6 +3258,19 @@
+         "url": "https://github.com/sponsors/ljharb"
+       }
+     },
++    "node_modules/is-binary-path": {
++      "version": "2.1.0",
++      "resolved": "https://registry.npmjs.org/is-binary-path/-/is-binary-path-2.1.0.tgz",
++      "integrity": "sha512-ZMERYes6pDydyuGidse7OsHxtbI7WVeUEozgR/g7rd0xUimYNlvZRE/K2MgZTjWy725IfelLeVcEM97mmtRGXw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "binary-extensions": "^2.0.0"
++      },
++      "engines": {
++        "node": ">=8"
++      }
++    },
+     "node_modules/is-boolean-object": {
+       "version": "1.2.2",
+       "resolved": "https://registry.npmjs.org/is-boolean-object/-/is-boolean-object-1.2.2.tgz",
+@@ -3398,6 +3706,16 @@
+         "@pkgjs/parseargs": "^0.11.0"
+       }
+     },
++    "node_modules/jiti": {
++      "version": "1.21.7",
++      "resolved": "https://registry.npmjs.org/jiti/-/jiti-1.21.7.tgz",
++      "integrity": "sha512-/imKNG4EbWNrVjoNC/1H5/9GFy+tqjGBHCaSsN+P2RnPqjsLmv6UD3Ej+Kj8nBWaRAwyk7kK5ZUc+OEatnTR3A==",
++      "dev": true,
++      "license": "MIT",
++      "bin": {
++        "jiti": "bin/jiti.js"
++      }
++    },
+     "node_modules/js-tokens": {
+       "version": "4.0.0",
+       "resolved": "https://registry.npmjs.org/js-tokens/-/js-tokens-4.0.0.tgz",
+@@ -3521,6 +3839,26 @@
+         "node": ">= 0.8.0"
+       }
+     },
++    "node_modules/lilconfig": {
++      "version": "3.1.3",
++      "resolved": "https://registry.npmjs.org/lilconfig/-/lilconfig-3.1.3.tgz",
++      "integrity": "sha512-/vlFKAoH5Cgt3Ie+JLhRbwOsCQePABiU3tJ1egGvyQ+33R/vcwM2Zl2QR/LzjsBeItPt3oSVXapn+m4nQDvpzw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=14"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/antonk52"
++      }
++    },
++    "node_modules/lines-and-columns": {
++      "version": "1.2.4",
++      "resolved": "https://registry.npmjs.org/lines-and-columns/-/lines-and-columns-1.2.4.tgz",
++      "integrity": "sha512-7ylylesZQ/PV29jhEDl3Ufjo6ZX7gCqJr5F7PKrqc93v7fzSymt1BpwEU8nAUXs8qzzvqhbjhK5QZg6Mt/HkBg==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/locate-path": {
+       "version": "6.0.0",
+       "resolved": "https://registry.npmjs.org/locate-path/-/locate-path-6.0.0.tgz",
+@@ -3637,6 +3975,18 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/mz": {
++      "version": "2.7.0",
++      "resolved": "https://registry.npmjs.org/mz/-/mz-2.7.0.tgz",
++      "integrity": "sha512-z81GNO7nnYMEhrGh9LeymoE4+Yr0Wn5McHIZMK5cfQCl+NDX08sCZgUc9/6MHni9IWuFLm1Z3HTCXu2z9fN62Q==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "any-promise": "^1.0.0",
++        "object-assign": "^4.0.1",
++        "thenify-all": "^1.0.0"
++      }
++    },
+     "node_modules/nanoid": {
+       "version": "3.3.12",
+       "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.12.tgz",
+@@ -3754,6 +4104,26 @@
+         "semver": "bin/semver.js"
+       }
+     },
++    "node_modules/node-releases": {
++      "version": "2.0.50",
++      "resolved": "https://registry.npmjs.org/node-releases/-/node-releases-2.0.50.tgz",
++      "integrity": "sha512-J6l92tKHX6w8Jy5nO1Vuc01NoIiRGi/d6qBKVxh+IQ8Cr3b6HbVNfKiF8ZpFKufTwpwxMmce2W3iQZ861ZRyTg==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      }
++    },
++    "node_modules/normalize-path": {
++      "version": "3.0.0",
++      "resolved": "https://registry.npmjs.org/normalize-path/-/normalize-path-3.0.0.tgz",
++      "integrity": "sha512-6eZs5Ls3WtCisHWp9S2GUy8dqkpGi4BVSz3GaqiE6ezub0512ESztXUwUB6C6IKbQkY2Pnb/mD4WYojCRwcwLA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
+     "node_modules/object-assign": {
+       "version": "4.1.1",
+       "resolved": "https://registry.npmjs.org/object-assign/-/object-assign-4.1.1.tgz",
+@@ -3764,6 +4134,16 @@
+         "node": ">=0.10.0"
+       }
+     },
++    "node_modules/object-hash": {
++      "version": "3.0.0",
++      "resolved": "https://registry.npmjs.org/object-hash/-/object-hash-3.0.0.tgz",
++      "integrity": "sha512-RSn9F68PjH9HqtltsSnqYC1XXoWe9Bju5+213R98cNGttag9q9yAOTzdbsqvIa7aNm5WffBZFpWYr2aWrklWAw==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">= 6"
++      }
++    },
+     "node_modules/object-inspect": {
+       "version": "1.13.4",
+       "resolved": "https://registry.npmjs.org/object-inspect/-/object-inspect-1.13.4.tgz",
+@@ -4051,6 +4431,26 @@
+         "url": "https://github.com/sponsors/jonschlinkert"
+       }
+     },
++    "node_modules/pify": {
++      "version": "2.3.0",
++      "resolved": "https://registry.npmjs.org/pify/-/pify-2.3.0.tgz",
++      "integrity": "sha512-udgsAY+fTnvv7kI7aaxbqwWNb0AHiB0qBO89PZKPkoTmGOgdbrHDKD+0B2X4uTfJ/FT1R09r9gTsjUjNJotuog==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">=0.10.0"
++      }
++    },
++    "node_modules/pirates": {
++      "version": "4.0.7",
++      "resolved": "https://registry.npmjs.org/pirates/-/pirates-4.0.7.tgz",
++      "integrity": "sha512-TfySrs/5nm8fQJDcBDuUng3VOUKsd7S+zqvbOTiGXHfxX4wK31ard+hoNuvkicM/2YFzlpDgABOevKSsB4G/FA==",
++      "dev": true,
++      "license": "MIT",
++      "engines": {
++        "node": ">= 6"
++      }
++    },
+     "node_modules/playwright": {
+       "version": "1.42.1",
+       "resolved": "https://registry.npmjs.org/playwright/-/playwright-1.42.1.tgz",
+@@ -4121,6 +4521,162 @@
+         "node": "^10 || ^12 || >=14"
+       }
+     },
++    "node_modules/postcss-import": {
++      "version": "15.1.0",
++      "resolved": "https://registry.npmjs.org/postcss-import/-/postcss-import-15.1.0.tgz",
++      "integrity": "sha512-hpr+J05B2FVYUAXHeK1YyI267J/dDDhMU6B6civm8hSY1jYJnBXxzKDKDswzJmtLHryrjhnDjqqp/49t8FALew==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "postcss-value-parser": "^4.0.0",
++        "read-cache": "^1.0.0",
++        "resolve": "^1.1.7"
++      },
++      "engines": {
++        "node": ">=14.0.0"
++      },
++      "peerDependencies": {
++        "postcss": "^8.0.0"
++      }
++    },
++    "node_modules/postcss-import/node_modules/resolve": {
++      "version": "1.22.12",
++      "resolved": "https://registry.npmjs.org/resolve/-/resolve-1.22.12.tgz",
++      "integrity": "sha512-TyeJ1zif53BPfHootBGwPRYT1RUt6oGWsaQr8UyZW/eAm9bKoijtvruSDEmZHm92CwS9nj7/fWttqPCgzep8CA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0",
++        "is-core-module": "^2.16.1",
++        "path-parse": "^1.0.7",
++        "supports-preserve-symlinks-flag": "^1.0.0"
++      },
++      "bin": {
++        "resolve": "bin/resolve"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
++    "node_modules/postcss-js": {
++      "version": "4.1.0",
++      "resolved": "https://registry.npmjs.org/postcss-js/-/postcss-js-4.1.0.tgz",
++      "integrity": "sha512-oIAOTqgIo7q2EOwbhb8UalYePMvYoIeRY2YKntdpFQXNosSu3vLrniGgmH9OKs/qAkfoj5oB3le/7mINW1LCfw==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "camelcase-css": "^2.0.1"
++      },
++      "engines": {
++        "node": "^12 || ^14 || >= 16"
++      },
++      "peerDependencies": {
++        "postcss": "^8.4.21"
++      }
++    },
++    "node_modules/postcss-load-config": {
++      "version": "6.0.1",
++      "resolved": "https://registry.npmjs.org/postcss-load-config/-/postcss-load-config-6.0.1.tgz",
++      "integrity": "sha512-oPtTM4oerL+UXmx+93ytZVN82RrlY/wPUV8IeDxFrzIjXOLF1pN+EmKPLbubvKHT2HC20xXsCAH2Z+CKV6Oz/g==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "lilconfig": "^3.1.1"
++      },
++      "engines": {
++        "node": ">= 18"
++      },
++      "peerDependencies": {
++        "jiti": ">=1.21.0",
++        "postcss": ">=8.0.9",
++        "tsx": "^4.8.1",
++        "yaml": "^2.4.2"
++      },
++      "peerDependenciesMeta": {
++        "jiti": {
++          "optional": true
++        },
++        "postcss": {
++          "optional": true
++        },
++        "tsx": {
++          "optional": true
++        },
++        "yaml": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/postcss-nested": {
++      "version": "6.2.0",
++      "resolved": "https://registry.npmjs.org/postcss-nested/-/postcss-nested-6.2.0.tgz",
++      "integrity": "sha512-HQbt28KulC5AJzG+cZtj9kvKB93CFCdLvog1WFLf1D+xmMvPGlBstkpTEZfK5+AN9hfJocyBFCNiqyS48bpgzQ==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "postcss-selector-parser": "^6.1.1"
++      },
++      "engines": {
++        "node": ">=12.0"
++      },
++      "peerDependencies": {
++        "postcss": "^8.2.14"
++      }
++    },
++    "node_modules/postcss-selector-parser": {
++      "version": "6.1.4",
++      "resolved": "https://registry.npmjs.org/postcss-selector-parser/-/postcss-selector-parser-6.1.4.tgz",
++      "integrity": "sha512-bIoJLOmjCO1S9XdY/DcnR5hJxvrDir1PbGChrzXG3vw0/FOliy/fA3dmdhQ441kah4gKv+TwckGzex6wNS5cnQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "cssesc": "^3.0.0",
++        "util-deprecate": "^1.0.2"
++      },
++      "engines": {
++        "node": ">=4"
++      }
++    },
++    "node_modules/postcss-value-parser": {
++      "version": "4.2.0",
++      "resolved": "https://registry.npmjs.org/postcss-value-parser/-/postcss-value-parser-4.2.0.tgz",
++      "integrity": "sha512-1NNCs6uurfkVbeXG4S8JFT9t19m45ICnif8zWLd5oPSZ50QnwMfK+H3jv408d4jw/7Bttv5axS5IiHoLaVNHeQ==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/prelude-ls": {
+       "version": "1.2.1",
+       "resolved": "https://registry.npmjs.org/prelude-ls/-/prelude-ls-1.2.1.tgz",
+@@ -4206,6 +4762,29 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/read-cache": {
++      "version": "1.0.0",
++      "resolved": "https://registry.npmjs.org/read-cache/-/read-cache-1.0.0.tgz",
++      "integrity": "sha512-Owdv/Ft7IjOgm/i0xvNDZ1LrRANRfew4b2prF3OWMQLxLfu3bS8FVhCsrSCMK4lR56Y9ya+AThoTpDCTxCmpRA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "pify": "^2.3.0"
++      }
++    },
++    "node_modules/readdirp": {
++      "version": "3.6.0",
++      "resolved": "https://registry.npmjs.org/readdirp/-/readdirp-3.6.0.tgz",
++      "integrity": "sha512-hOS089on8RduqdbhvQ5Z37A0ESjsqz6qnRcffsMU3495FuTdqSm+7bhJ29JvIOsBDEEnan5DPu9t3To9VRlMzA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "picomatch": "^2.2.1"
++      },
++      "engines": {
++        "node": ">=8.10.0"
++      }
++    },
+     "node_modules/reflect.getprototypeof": {
+       "version": "1.0.10",
+       "resolved": "https://registry.npmjs.org/reflect.getprototypeof/-/reflect.getprototypeof-1.0.10.tgz",
+@@ -4911,6 +5490,29 @@
+         }
+       }
+     },
++    "node_modules/sucrase": {
++      "version": "3.35.1",
++      "resolved": "https://registry.npmjs.org/sucrase/-/sucrase-3.35.1.tgz",
++      "integrity": "sha512-DhuTmvZWux4H1UOnWMB3sk0sbaCVOoQZjv8u1rDoTV0HTdGem9hkAZtl4JZy8P2z4Bg0nT+YMeOFyVr4zcG5Tw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@jridgewell/gen-mapping": "^0.3.2",
++        "commander": "^4.0.0",
++        "lines-and-columns": "^1.1.6",
++        "mz": "^2.7.0",
++        "pirates": "^4.0.1",
++        "tinyglobby": "^0.2.11",
++        "ts-interface-checker": "^0.1.9"
++      },
++      "bin": {
++        "sucrase": "bin/sucrase",
++        "sucrase-node": "bin/sucrase-node"
++      },
++      "engines": {
++        "node": ">=16 || 14 >=14.17"
++      }
++    },
+     "node_modules/supports-color": {
+       "version": "7.2.0",
+       "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-7.2.0.tgz",
+@@ -4937,6 +5539,95 @@
+         "url": "https://github.com/sponsors/ljharb"
+       }
+     },
++    "node_modules/tailwindcss": {
++      "version": "3.4.19",
++      "resolved": "https://registry.npmjs.org/tailwindcss/-/tailwindcss-3.4.19.tgz",
++      "integrity": "sha512-3ofp+LL8E+pK/JuPLPggVAIaEuhvIz4qNcf3nA1Xn2o/7fb7s/TYpHhwGDv1ZU3PkBluUVaF8PyCHcm48cKLWQ==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@alloc/quick-lru": "^5.2.0",
++        "arg": "^5.0.2",
++        "chokidar": "^3.6.0",
++        "didyoumean": "^1.2.2",
++        "dlv": "^1.1.3",
++        "fast-glob": "^3.3.2",
++        "glob-parent": "^6.0.2",
++        "is-glob": "^4.0.3",
++        "jiti": "^1.21.7",
++        "lilconfig": "^3.1.3",
++        "micromatch": "^4.0.8",
++        "normalize-path": "^3.0.0",
++        "object-hash": "^3.0.0",
++        "picocolors": "^1.1.1",
++        "postcss": "^8.4.47",
++        "postcss-import": "^15.1.0",
++        "postcss-js": "^4.0.1",
++        "postcss-load-config": "^4.0.2 || ^5.0 || ^6.0",
++        "postcss-nested": "^6.2.0",
++        "postcss-selector-parser": "^6.1.2",
++        "resolve": "^1.22.8",
++        "sucrase": "^3.35.0"
++      },
++      "bin": {
++        "tailwind": "lib/cli.js",
++        "tailwindcss": "lib/cli.js"
++      },
++      "engines": {
++        "node": ">=14.0.0"
++      }
++    },
++    "node_modules/tailwindcss/node_modules/postcss": {
++      "version": "8.5.15",
++      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.15.tgz",
++      "integrity": "sha512-FfR8sjd4em2T6fb3I2MwAJU7HWVMr9zba+enmQeeWFfCbm+UOC/0X4DS8XtpUTMwWMGbjKYP7xjfNekzyGmB3A==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/postcss/"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/postcss"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "nanoid": "^3.3.12",
++        "picocolors": "^1.1.1",
++        "source-map-js": "^1.2.1"
++      },
++      "engines": {
++        "node": "^10 || ^12 || >=14"
++      }
++    },
++    "node_modules/tailwindcss/node_modules/resolve": {
++      "version": "1.22.12",
++      "resolved": "https://registry.npmjs.org/resolve/-/resolve-1.22.12.tgz",
++      "integrity": "sha512-TyeJ1zif53BPfHootBGwPRYT1RUt6oGWsaQr8UyZW/eAm9bKoijtvruSDEmZHm92CwS9nj7/fWttqPCgzep8CA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "es-errors": "^1.3.0",
++        "is-core-module": "^2.16.1",
++        "path-parse": "^1.0.7",
++        "supports-preserve-symlinks-flag": "^1.0.0"
++      },
++      "bin": {
++        "resolve": "bin/resolve"
++      },
++      "engines": {
++        "node": ">= 0.4"
++      },
++      "funding": {
++        "url": "https://github.com/sponsors/ljharb"
++      }
++    },
+     "node_modules/text-table": {
+       "version": "0.2.0",
+       "resolved": "https://registry.npmjs.org/text-table/-/text-table-0.2.0.tgz",
+@@ -4944,6 +5635,29 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/thenify": {
++      "version": "3.3.1",
++      "resolved": "https://registry.npmjs.org/thenify/-/thenify-3.3.1.tgz",
++      "integrity": "sha512-RVZSIV5IG10Hk3enotrhvz0T9em6cyHBLkH/YAZuKqd8hRkKhSfCGIcP2KUY0EPxndzANBmNllzWPwak+bheSw==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "any-promise": "^1.0.0"
++      }
++    },
++    "node_modules/thenify-all": {
++      "version": "1.6.0",
++      "resolved": "https://registry.npmjs.org/thenify-all/-/thenify-all-1.6.0.tgz",
++      "integrity": "sha512-RNxQH/qI8/t3thXJDwcstUO4zeqo64+Uy/+sNVRBx4Xn2OX+OZ9oP+iJnNFqplFra2ZUVeKCSa2oVWi3T4uVmA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "thenify": ">= 3.1.0 < 4"
++      },
++      "engines": {
++        "node": ">=0.8"
++      }
++    },
+     "node_modules/tinyglobby": {
+       "version": "0.2.17",
+       "resolved": "https://registry.npmjs.org/tinyglobby/-/tinyglobby-0.2.17.tgz",
+@@ -5018,6 +5732,13 @@
+         "typescript": ">=4.2.0"
+       }
+     },
++    "node_modules/ts-interface-checker": {
++      "version": "0.1.13",
++      "resolved": "https://registry.npmjs.org/ts-interface-checker/-/ts-interface-checker-0.1.13.tgz",
++      "integrity": "sha512-Y/arvbn+rrz3JCKl9C4kVNfTfSm2/mEp5FSz5EsZSANGPSlQrpRI5M4PKF+mJnE52jOO90PnPSc3Ur3bTQw0gA==",
++      "dev": true,
++      "license": "Apache-2.0"
++    },
+     "node_modules/tsconfig-paths": {
+       "version": "3.15.0",
+       "resolved": "https://registry.npmjs.org/tsconfig-paths/-/tsconfig-paths-3.15.0.tgz",
+@@ -5219,6 +5940,37 @@
+         "@unrs/resolver-binding-win32-x64-msvc": "1.12.2"
+       }
+     },
++    "node_modules/update-browserslist-db": {
++      "version": "1.2.3",
++      "resolved": "https://registry.npmjs.org/update-browserslist-db/-/update-browserslist-db-1.2.3.tgz",
++      "integrity": "sha512-Js0m9cx+qOgDxo0eMiFGEueWztz+d4+M3rGlmKPT+T4IS/jP4ylw3Nwpu6cpTTP8R1MAC1kF4VbdLt3ARf209w==",
++      "dev": true,
++      "funding": [
++        {
++          "type": "opencollective",
++          "url": "https://opencollective.com/browserslist"
++        },
++        {
++          "type": "tidelift",
++          "url": "https://tidelift.com/funding/github/npm/browserslist"
++        },
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/ai"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "escalade": "^3.2.0",
++        "picocolors": "^1.1.1"
++      },
++      "bin": {
++        "update-browserslist-db": "cli.js"
++      },
++      "peerDependencies": {
++        "browserslist": ">= 4.21.0"
++      }
++    },
+     "node_modules/uri-js": {
+       "version": "4.4.1",
+       "resolved": "https://registry.npmjs.org/uri-js/-/uri-js-4.4.1.tgz",
+@@ -5229,6 +5981,13 @@
+         "punycode": "^2.1.0"
+       }
+     },
++    "node_modules/util-deprecate": {
++      "version": "1.0.2",
++      "resolved": "https://registry.npmjs.org/util-deprecate/-/util-deprecate-1.0.2.tgz",
++      "integrity": "sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/which": {
+       "version": "2.0.2",
+       "resolved": "https://registry.npmjs.org/which/-/which-2.0.2.tgz",
+diff --git a/web/package.json b/web/package.json
+index 8bd7511..ed643b3 100644
+--- a/web/package.json
++++ b/web/package.json
+@@ -19,8 +19,10 @@
+     "@types/node": "20.11.30",
+     "@types/react": "18.2.67",
+     "@types/react-dom": "18.2.22",
++    "autoprefixer": "^10.5.2",
+     "eslint": "8.57.0",
+     "eslint-config-next": "14.1.4",
++    "tailwindcss": "^3.4.19",
+     "typescript": "5.4.3"
+   }
+ }
+diff --git a/web/pages/extract.tsx b/web/pages/extract.tsx
+index cc7d9f6..12d57dc 100644
+--- a/web/pages/extract.tsx
++++ b/web/pages/extract.tsx
+@@ -1,8 +1,24 @@
+ import { useState } from "react";
++import Head from "next/head";
++import Link from "next/link";
+ import type { ExtractResponse } from "../lib/types";
++import { Button } from "../components/Button";
++import { Card } from "../components/Card";
+ 
+ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+ 
++const LABEL_COLORS: Record<string, string> = {
++  PERSON: "bg-sage/15 text-sage-dark dark:bg-sage-dark/30 dark:text-sage-light border-sage/30",
++  ORG: "bg-saffron/15 text-saffron-dark dark:bg-saffron-dark/30 dark:text-saffron border-saffron/30",
++  GPE: "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300 border-blue-200",
++  DATE: "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300 border-purple-200",
++  PRODUCT: "bg-warm-gray/15 text-warm-gray-dark dark:bg-warm-gray-dark/20 dark:text-warm-gray-light border-warm-gray/30",
++};
++
++function labelClass(label: string): string {
++  return LABEL_COLORS[label] ?? "bg-warm-gray/10 text-charcoal dark:text-cream border-warm-gray/20";
++}
++
+ export default function ExtractPage() {
+   const [text, setText] = useState("");
+   const [result, setResult] = useState<ExtractResponse | null>(null);
+@@ -10,6 +26,7 @@ export default function ExtractPage() {
+   const [loading, setLoading] = useState(false);
+ 
+   async function submit() {
++    if (!text.trim()) return;
+     setLoading(true);
+     setError(null);
+     setResult(null);
+@@ -20,53 +37,164 @@ export default function ExtractPage() {
+         body: JSON.stringify({ text }),
+       });
+       if (r.status === 422) {
+-        setError("Text shape rejected by validation (empty or > 5000 chars).");
++        setError("Text was rejected — it must be between 1 and 5 000 characters.");
+         return;
+       }
+       if (r.status === 503) {
+-        setError("Backend not ready. Try again in a moment.");
++        setError("The backend is still loading. Wait a moment and try again.");
+         return;
+       }
+       if (!r.ok) {
+-        setError(`Unexpected status: ${r.status}`);
++        setError(`Unexpected error (HTTP ${r.status}). Please try again.`);
+         return;
+       }
+       setResult((await r.json()) as ExtractResponse);
+-    } catch (e) {
+-      setError("Network error reaching the backend.");
++    } catch {
++      setError("Could not reach the backend. Check your connection and try again.");
+     } finally {
+       setLoading(false);
+     }
+   }
+ 
+   return (
+-    <main>
+-      <h1>Extract — Named Entity Recognition</h1>
+-      <textarea
+-        value={text}
+-        onChange={(e) => setText(e.target.value)}
+-        placeholder="Paste text to extract named entities from..."
+-        rows={6}
+-        cols={60}
+-      />
+-      <div>
+-        <button onClick={submit} disabled={loading || !text}>
+-          {loading ? "Extracting..." : "Extract"}
+-        </button>
++    <>
++      <Head>
++        <title>Extract Entities · M10</title>
++      </Head>
++      <div className="min-h-screen bg-cream dark:bg-charcoal">
++        <main className="max-w-4xl mx-auto px-8 py-12">
++
++          <nav className="mb-10">
++            <Link
++              href="/"
++              className="text-sm text-warm-gray hover:text-sage dark:hover:text-saffron transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-saffron rounded"
++            >
++              ← Back to demos
++            </Link>
++          </nav>
++
++          <header className="mb-10 animate-slide-up">
++            <span className="inline-block mb-3 px-2.5 py-1 rounded-md bg-saffron/20 text-saffron-dark dark:text-saffron font-mono text-xs font-bold tracking-wide">
++              NER
++            </span>
++            <h1 className="font-display text-4xl font-bold text-charcoal dark:text-cream mb-3">
++              Extract Entities
++            </h1>
++            <p className="text-warm-gray dark:text-warm-gray-light max-w-xl">
++              Paste any text to identify named entities: people, places, dates,
++              organisations, and more via spaCy.
++            </p>
++          </header>
++
++          {/* Form */}
++          <form
++            onSubmit={(e) => { e.preventDefault(); submit(); }}
++            className="mb-8 space-y-4 animate-fade-in"
++          >
++            <label htmlFor="extract-input" className="block text-sm font-medium text-charcoal dark:text-cream">
++              Text to analyse
++            </label>
++            <textarea
++              id="extract-input"
++              value={text}
++              onChange={(e) => setText(e.target.value)}
++              placeholder="Paste text to extract named entities from…"
++              rows={6}
++              maxLength={5000}
++              aria-label="Text to extract entities from"
++              className={[
++                "w-full rounded-lg border px-4 py-3 resize-y",
++                "bg-cream dark:bg-charcoal-light",
++                "text-charcoal dark:text-cream",
++                "placeholder:text-warm-gray",
++                "transition-all duration-200",
++                "focus:outline-none focus:ring-2 focus:ring-saffron focus:border-transparent",
++                "border-warm-gray/50 dark:border-warm-gray-dark",
++              ].join(" ")}
++            />
++            <div className="flex items-center justify-between">
++              <Button
++                type="submit"
++                loading={loading}
++                disabled={!text.trim()}
++              >
++                {loading ? "Extracting…" : "Extract"}
++              </Button>
++              <span className="text-xs text-warm-gray font-mono">
++                {text.length} / 5 000
++              </span>
++            </div>
++          </form>
++
++          {/* Error */}
++          {error && (
++            <Card variant="error" className="mb-8 animate-fade-in">
++              <p role="alert" data-testid="error" className="text-red-700 dark:text-red-400 text-sm">
++                {error}
++              </p>
++            </Card>
++          )}
++
++          {/* Loading skeleton */}
++          {loading && (
++            <div className="animate-pulse space-y-3" aria-busy="true" aria-label="Extracting entities">
++              {[80, 60, 90, 50].map((w, i) => (
++                <div key={i} className={`h-8 bg-warm-gray/20 rounded`} style={{ width: `${w}%` }} />
++              ))}
++            </div>
++          )}
++
++          {/* Results */}
++          {result && !loading && (
++            <section className="animate-slide-up">
++              <h2 className="text-xs font-mono font-bold text-warm-gray dark:text-warm-gray-light uppercase tracking-widest mb-4">
++                Entities found ({result.entities.length})
++              </h2>
++
++              {result.entities.length === 0 ? (
++                <Card>
++                  <p className="text-warm-gray dark:text-warm-gray-light text-sm italic">
++                    No named entities found in this text.
++                  </p>
++                </Card>
++              ) : (
++                <div className="overflow-x-auto rounded-xl border border-warm-gray/20 dark:border-warm-gray-dark/30">
++                  <table className="w-full text-sm">
++                    <thead>
++                      <tr className="bg-cream-dark dark:bg-charcoal-light border-b border-warm-gray/20 dark:border-warm-gray-dark/30">
++                        <th className="px-4 py-3 text-left font-semibold text-charcoal dark:text-cream">Text</th>
++                        <th className="px-4 py-3 text-left font-semibold text-charcoal dark:text-cream">Label</th>
++                        <th className="px-4 py-3 text-left font-semibold text-charcoal dark:text-cream font-mono">Start</th>
++                        <th className="px-4 py-3 text-left font-semibold text-charcoal dark:text-cream font-mono">End</th>
++                      </tr>
++                    </thead>
++                    <tbody className="divide-y divide-warm-gray/10 dark:divide-warm-gray-dark/20">
++                      {result.entities.map((e, i) => (
++                        <tr
++                          key={i}
++                          data-testid="entity-span"
++                          className="bg-cream dark:bg-charcoal hover:bg-cream-dark dark:hover:bg-charcoal-light transition-colors duration-150"
++                        >
++                          <td className="px-4 py-3 font-medium text-charcoal dark:text-cream">
++                            {e.text}
++                          </td>
++                          <td className="px-4 py-3">
++                            <span className={`inline-block px-2 py-0.5 rounded border text-xs font-mono font-bold ${labelClass(e.label)}`}>
++                              {e.label}
++                            </span>
++                          </td>
++                          <td className="px-4 py-3 font-mono text-warm-gray dark:text-warm-gray-light">{e.start}</td>
++                          <td className="px-4 py-3 font-mono text-warm-gray dark:text-warm-gray-light">{e.end}</td>
++                        </tr>
++                      ))}
++                    </tbody>
++                  </table>
++                </div>
++              )}
++            </section>
++          )}
++        </main>
+       </div>
+-      {error && <p role="alert" data-testid="error">{error}</p>}
+-      {result && (
+-        <section>
+-          <h2>Entities</h2>
+-          <ul>
+-            {result.entities.map((e, i) => (
+-              <li key={i} data-testid="entity-span">
+-                <strong>{e.text}</strong> — {e.label} ({e.start}–{e.end})
+-              </li>
+-            ))}
+-          </ul>
+-        </section>
+-      )}
+-    </main>
++    </>
+   );
+ }
+diff --git a/web/pages/index.tsx b/web/pages/index.tsx
+index 8f7e805..7057b8e 100644
+--- a/web/pages/index.tsx
++++ b/web/pages/index.tsx
+@@ -1,14 +1,79 @@
+ import Link from "next/link";
++import Head from "next/head";
++
++interface DemoCard {
++  href: string;
++  title: string;
++  description: string;
++  badge: string;
++}
++
++const demos: DemoCard[] = [
++  {
++    href: "/extract",
++    title: "Extract entities",
++    description: "Named entity recognition — paste any text and identify people, places, ingredients, and more.",
++    badge: "NER",
++  },
++  {
++    href: "/kg",
++    title: "Query the recipe knowledge graph",
++    description: "Ask natural-language questions answered by a Neo4j graph of recipes, cuisines, and techniques.",
++    badge: "KG",
++  },
++  {
++    href: "/rag",
++    title: "Ask a recipe question (RAG)",
++    description: "Retrieval-augmented generation — get a cited answer grounded in the recipe corpus.",
++    badge: "RAG",
++  },
++];
+ 
+ export default function Home() {
+   return (
+-    <main>
+-      <h1>M10 Recipe Service — Demo</h1>
+-      <ul>
+-        <li><Link href="/extract">Extract entities</Link></li>
+-        <li><Link href="/kg">Query the recipe knowledge graph</Link></li>
+-        <li><Link href="/rag">Ask a recipe question (RAG)</Link></li>
+-      </ul>
+-    </main>
++    <>
++      <Head>
++        <title>M10 Recipe Service</title>
++        <meta name="description" content="Recipe knowledge service with NER, Knowledge Graph, and RAG" />
++      </Head>
++      <div className="min-h-screen bg-cream dark:bg-charcoal">
++        <main className="max-w-4xl mx-auto px-8 py-16">
++          {/* Hero */}
++          <header className="mb-16 animate-slide-up">
++            <p className="text-saffron font-mono text-sm font-medium tracking-widest uppercase mb-3">
++              Integration 10 · M10 Lab
++            </p>
++            <h1 className="font-display text-5xl font-bold text-charcoal dark:text-cream leading-tight mb-4">
++              Recipe Knowledge<br />Service
++            </h1>
++            <p className="text-warm-gray dark:text-warm-gray-light text-lg max-w-xl">
++              Three ways to explore a recipe corpus — entity extraction, graph queries,
++              and retrieval-augmented generation with cited answers.
++            </p>
++          </header>
++
++          {/* Demo cards */}
++          <ul className="grid gap-6 sm:grid-cols-3 list-none p-0 animate-fade-in">
++            {demos.map((d) => (
++              <li key={d.href}>
++                <Link href={d.href} className="group block h-full">
++                  <div className="h-full rounded-xl border border-warm-gray/20 dark:border-warm-gray-dark/30 bg-cream dark:bg-charcoal-light p-6 transition-all duration-200 shadow-sm group-hover:shadow-md group-hover:border-saffron/40 group-focus-within:ring-2 group-focus-within:ring-saffron">
++                    <span className="inline-block mb-4 px-2.5 py-1 rounded-md bg-saffron/20 text-saffron-dark dark:text-saffron font-mono text-xs font-bold tracking-wide">
++                      {d.badge}
++                    </span>
++                    <h2 className="font-display font-bold text-lg text-charcoal dark:text-cream mb-2 group-hover:text-sage dark:group-hover:text-saffron transition-colors duration-200">
++                      {d.title}
++                    </h2>
++                    <p className="text-sm text-warm-gray dark:text-warm-gray-light leading-relaxed">
++                      {d.description}
++                    </p>
++                  </div>
++                </Link>
++              </li>
++            ))}
++          </ul>
++        </main>
++      </div>
++    </>
+   );
+ }
+diff --git a/web/pages/kg.tsx b/web/pages/kg.tsx
+index 0345b7d..ed2c432 100644
+--- a/web/pages/kg.tsx
++++ b/web/pages/kg.tsx
+@@ -1,5 +1,9 @@
+ import { useState } from "react";
++import Head from "next/head";
++import Link from "next/link";
+ import type { KGResponse, UnsupportedQueryDetail } from "../lib/types";
++import { Button } from "../components/Button";
++import { Card } from "../components/Card";
+ 
+ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+ 
+@@ -11,6 +15,7 @@ export default function KgPage() {
+   const [loading, setLoading] = useState(false);
+ 
+   async function submit() {
++    if (!question.trim()) return;
+     setLoading(true);
+     setError(null);
+     setSupported(null);
+@@ -19,79 +24,212 @@ export default function KgPage() {
+       const r = await fetch(`${API_URL}/kg/query`, {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ question }),
++        body: JSON.stringify({ question: question.trim() }),
+       });
+       if (r.status === 422) {
+         const body = await r.json();
+         const detail = body.detail as UnsupportedQueryDetail | undefined;
+         if (detail?.reason === "unsupported_question") {
+-          setError("That question shape is not supported. Try one of:");
++          setError("That question pattern isn't supported. Try one of these:");
+           setSupported(detail.supported_patterns);
+         } else {
+-          setError("Validation rejected the request.");
++          setError("The request was rejected by validation.");
+         }
+         return;
+       }
+       if (r.status === 503) {
+-        setError("Backend not ready. Try again in a moment.");
++        setError("The backend is still loading. Wait a moment and try again.");
+         return;
+       }
+       if (!r.ok) {
+-        setError(`Unexpected status: ${r.status}`);
++        setError(`Unexpected error (HTTP ${r.status}). Please try again.`);
+         return;
+       }
+       setResult((await r.json()) as KGResponse);
+-    } catch (e) {
+-      setError("Network error reaching the backend.");
++    } catch {
++      setError("Could not reach the backend. Check your connection and try again.");
+     } finally {
+       setLoading(false);
+     }
+   }
+ 
++  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
++    if (e.key === "Enter" && !loading && question.trim()) submit();
++  }
++
++  const columns = result?.rows.length
++    ? Object.keys(result.rows[0])
++    : [];
++
+   return (
+-    <main>
+-      <h1>Knowledge Graph — Recipe Query</h1>
+-      <input
+-        value={question}
+-        onChange={(e) => setQuestion(e.target.value)}
+-        placeholder="e.g. Find Sichuan recipes"
+-        size={60}
+-      />
+-      <button onClick={submit} disabled={loading || !question}>
+-        {loading ? "Querying..." : "Ask"}
+-      </button>
+-      {error && (
+-        <p role="alert" data-testid="error">
+-          {error}
+-        </p>
+-      )}
+-      {supported && (
+-        <ul data-testid="supported-patterns">
+-          {supported.map((p, i) => (
+-            <li key={i}>{p}</li>
+-          ))}
+-        </ul>
+-      )}
+-      {result && (
+-        <section>
+-          <h2>Cypher</h2>
+-          <pre>{result.cypher}</pre>
+-          <h2>Rows ({result.count})</h2>
+-          <table>
+-            <tbody>
+-              {result.rows.map((row, i) => (
+-                <tr key={i} data-testid="kg-row">
+-                  {Object.entries(row).map(([k, v]) => (
+-                    <td key={k}>
+-                      <strong>{k}:</strong> {String(v)}
+-                    </td>
++    <>
++      <Head>
++        <title>Knowledge Graph · M10</title>
++      </Head>
++      <div className="min-h-screen bg-cream dark:bg-charcoal">
++        <main className="max-w-4xl mx-auto px-8 py-12">
++
++          <nav className="mb-10">
++            <Link
++              href="/"
++              className="text-sm text-warm-gray hover:text-sage dark:hover:text-saffron transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-saffron rounded"
++            >
++              ← Back to demos
++            </Link>
++          </nav>
++
++          <header className="mb-10 animate-slide-up">
++            <span className="inline-block mb-3 px-2.5 py-1 rounded-md bg-saffron/20 text-saffron-dark dark:text-saffron font-mono text-xs font-bold tracking-wide">
++              KG
++            </span>
++            <h1 className="font-display text-4xl font-bold text-charcoal dark:text-cream mb-3">
++              Recipe Knowledge Graph
++            </h1>
++            <p className="text-warm-gray dark:text-warm-gray-light max-w-xl">
++              Query the Neo4j recipe graph with natural language. Pattern-matched to
++              Cypher and executed live.
++            </p>
++          </header>
++
++          {/* Form */}
++          <form
++            onSubmit={(e) => { e.preventDefault(); submit(); }}
++            className="mb-8 animate-fade-in"
++          >
++            <div className="flex flex-col sm:flex-row gap-3">
++              <input
++                value={question}
++                onChange={(e) => setQuestion(e.target.value)}
++                onKeyDown={handleKeyDown}
++                placeholder="e.g. Find Sichuan recipes"
++                maxLength={500}
++                aria-label="Knowledge graph question"
++                className={[
++                  "flex-1 rounded-lg border px-4 py-2.5",
++                  "bg-cream dark:bg-charcoal-light",
++                  "text-charcoal dark:text-cream",
++                  "placeholder:text-warm-gray",
++                  "transition-all duration-200",
++                  "focus:outline-none focus:ring-2 focus:ring-saffron focus:border-transparent",
++                  "border-warm-gray/50 dark:border-warm-gray-dark",
++                ].join(" ")}
++              />
++              <Button
++                type="submit"
++                loading={loading}
++                disabled={!question.trim()}
++              >
++                {loading ? "Querying…" : "Ask"}
++              </Button>
++            </div>
++          </form>
++
++          {/* Error + supported patterns */}
++          {error && (
++            <Card variant="error" className="mb-8 animate-fade-in">
++              <p role="alert" data-testid="error" className="text-red-700 dark:text-red-400 text-sm mb-3">
++                {error}
++              </p>
++              {supported && (
++                <ul
++                  data-testid="supported-patterns"
++                  className="list-none p-0 space-y-1"
++                >
++                  {supported.map((p, i) => (
++                    <li key={i}>
++                      <button
++                        type="button"
++                        onClick={() => { setQuestion(p); setError(null); setSupported(null); }}
++                        className="text-sm font-mono text-sage dark:text-saffron hover:underline focus:outline-none focus:ring-1 focus:ring-saffron rounded text-left"
++                      >
++                        → {p}
++                      </button>
++                    </li>
+                   ))}
+-                </tr>
++                </ul>
++              )}
++            </Card>
++          )}
++
++          {/* Loading skeleton */}
++          {loading && (
++            <div className="animate-pulse space-y-3" aria-busy="true" aria-label="Querying graph">
++              {[70, 90, 60, 80].map((w, i) => (
++                <div key={i} className="h-8 bg-warm-gray/20 rounded" style={{ width: `${w}%` }} />
+               ))}
+-            </tbody>
+-          </table>
+-        </section>
+-      )}
+-    </main>
++            </div>
++          )}
++
++          {/* Empty state */}
++          {!loading && !result && !error && (
++            <div className="text-center py-20 text-warm-gray animate-fade-in">
++              <p className="text-5xl mb-4" aria-hidden="true">🕸️</p>
++              <p className="font-display text-lg font-semibold text-charcoal/50 dark:text-cream/40">
++                Graph results will appear here
++              </p>
++            </div>
++          )}
++
++          {/* Results */}
++          {result && !loading && (
++            <section className="space-y-6 animate-slide-up">
++
++              {/* Cypher */}
++              <Card>
++                <h2 className="text-xs font-mono font-bold text-warm-gray dark:text-warm-gray-light uppercase tracking-widest mb-3">
++                  Generated Cypher
++                </h2>
++                <pre className="font-mono text-sm text-charcoal dark:text-cream bg-cream-dark dark:bg-charcoal/60 rounded-lg p-4 overflow-x-auto whitespace-pre-wrap">
++                  {result.cypher}
++                </pre>
++              </Card>
++
++              {/* Rows */}
++              <div>
++                <h2 className="text-xs font-mono font-bold text-warm-gray dark:text-warm-gray-light uppercase tracking-widest mb-4">
++                  Rows ({result.count})
++                </h2>
++                {result.count === 0 ? (
++                  <Card>
++                    <p className="text-warm-gray dark:text-warm-gray-light text-sm italic">
++                      No rows returned for this query.
++                    </p>
++                  </Card>
++                ) : (
++                  <div className="overflow-x-auto rounded-xl border border-warm-gray/20 dark:border-warm-gray-dark/30">
++                    <table className="w-full text-sm">
++                      <thead>
++                        <tr className="bg-cream-dark dark:bg-charcoal-light border-b border-warm-gray/20 dark:border-warm-gray-dark/30">
++                          {columns.map((col) => (
++                            <th key={col} className="px-4 py-3 text-left font-semibold text-charcoal dark:text-cream">
++                              {col}
++                            </th>
++                          ))}
++                        </tr>
++                      </thead>
++                      <tbody className="divide-y divide-warm-gray/10 dark:divide-warm-gray-dark/20">
++                        {result.rows.map((row, i) => (
++                          <tr
++                            key={i}
++                            data-testid="kg-row"
++                            className="bg-cream dark:bg-charcoal hover:bg-cream-dark dark:hover:bg-charcoal-light transition-colors duration-150"
++                          >
++                            {columns.map((col) => (
++                              <td key={col} className="px-4 py-3 text-charcoal dark:text-cream font-mono text-xs">
++                                {String(row[col] ?? "")}
++                              </td>
++                            ))}
++                          </tr>
++                        ))}
++                      </tbody>
++                    </table>
++                  </div>
++                )}
++              </div>
++            </section>
++          )}
++        </main>
++      </div>
++    </>
+   );
+ }
+diff --git a/web/pages/rag.tsx b/web/pages/rag.tsx
+index 1c2f1b6..8278587 100644
+--- a/web/pages/rag.tsx
++++ b/web/pages/rag.tsx
+@@ -1,5 +1,11 @@
+ import { useState } from "react";
++import Head from "next/head";
++import Link from "next/link";
+ import type { RAGResponse } from "../lib/types";
++import { Button } from "../components/Button";
++import { Card } from "../components/Card";
++import { CitationBadge } from "../components/CitationBadge";
++import { ConfidenceIndicator } from "../components/ConfidenceIndicator";
+ 
+ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+ 
+@@ -10,6 +16,7 @@ export default function RagPage() {
+   const [loading, setLoading] = useState(false);
+ 
+   async function submit() {
++    if (!question.trim()) return;
+     setLoading(true);
+     setError(null);
+     setResult(null);
+@@ -17,60 +24,189 @@ export default function RagPage() {
+       const r = await fetch(`${API_URL}/rag/answer`, {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ question, k: 4 }),
++        body: JSON.stringify({ question: question.trim(), k: 4 }),
+       });
+       if (r.status === 422) {
+-        setError("Question shape rejected by validation.");
++        setError("Question was rejected by validation — it may be too short or too long (max 500 chars).");
+         return;
+       }
+       if (r.status === 503) {
+-        setError("Backend not ready. Try again in a moment.");
++        setError("The backend is still loading. Wait a moment and try again.");
+         return;
+       }
+       if (!r.ok) {
+-        setError(`Unexpected status: ${r.status}`);
++        setError(`Unexpected error (HTTP ${r.status}). Please try again.`);
+         return;
+       }
+       setResult((await r.json()) as RAGResponse);
+-    } catch (e) {
+-      setError("Network error reaching the backend.");
++    } catch {
++      setError("Could not reach the backend. Check your connection and try again.");
+     } finally {
+       setLoading(false);
+     }
+   }
+ 
++  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
++    if (e.key === "Enter" && !loading && question.trim()) submit();
++  }
++
+   return (
+-    <main>
+-      <h1>RAG — Cited Answer</h1>
+-      <input
+-        value={question}
+-        onChange={(e) => setQuestion(e.target.value)}
+-        placeholder="Ask a recipe question..."
+-        size={60}
+-      />
+-      <button onClick={submit} disabled={loading || !question}>
+-        {loading ? "Asking..." : "Ask"}
+-      </button>
+-      {error && (
+-        <p role="alert" data-testid="error">
+-          {error}
+-        </p>
+-      )}
+-      {result && (
+-        <article>
+-          <p data-testid="rag-answer">{result.answer}</p>
+-          <ul>
+-            {result.citations.map((c) => (
+-              <li key={c.chunk_id}>
+-                [
+-                <span data-testid="citation-marker">{c.chunk_id}</span>
+-                ] score: {c.score.toFixed(3)}
+-              </li>
+-            ))}
+-          </ul>
+-          <p>Confidence: {result.confidence.toFixed(2)}</p>
+-        </article>
+-      )}
+-    </main>
++    <>
++      <Head>
++        <title>RAG — Cited Answer · M10</title>
++      </Head>
++      <div className="min-h-screen bg-cream dark:bg-charcoal">
++        <main className="max-w-4xl mx-auto px-8 py-12">
++
++          {/* Back nav */}
++          <nav className="mb-10">
++            <Link
++              href="/"
++              className="text-sm text-warm-gray hover:text-sage dark:hover:text-saffron transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-saffron rounded"
++            >
++              ← Back to demos
++            </Link>
++          </nav>
++
++          {/* Hero */}
++          <header className="mb-10 animate-slide-up">
++            <span className="inline-block mb-3 px-2.5 py-1 rounded-md bg-saffron/20 text-saffron-dark dark:text-saffron font-mono text-xs font-bold tracking-wide">
++              RAG
++            </span>
++            <h1 className="font-display text-4xl font-bold text-charcoal dark:text-cream mb-3">
++              Cited Recipe Answer
++            </h1>
++            <p className="text-warm-gray dark:text-warm-gray-light max-w-xl">
++              Ask any recipe question. The answer is grounded in the corpus and every
++              claim is backed by a numbered citation.
++            </p>
++          </header>
++
++          {/* Form */}
++          <form
++            onSubmit={(e) => { e.preventDefault(); submit(); }}
++            className="mb-8 animate-fade-in"
++          >
++            <div className="flex flex-col sm:flex-row gap-3">
++              <input
++                value={question}
++                onChange={(e) => setQuestion(e.target.value)}
++                onKeyDown={handleKeyDown}
++                placeholder="e.g. How do I prep ginger for stir-fry?"
++                maxLength={500}
++                aria-label="Recipe question"
++                className={[
++                  "flex-1 rounded-lg border px-4 py-2.5",
++                  "bg-cream dark:bg-charcoal-light",
++                  "text-charcoal dark:text-cream",
++                  "placeholder:text-warm-gray",
++                  "transition-all duration-200",
++                  "focus:outline-none focus:ring-2 focus:ring-saffron focus:border-transparent",
++                  "border-warm-gray/50 dark:border-warm-gray-dark",
++                ].join(" ")}
++              />
++              <Button
++                type="submit"
++                loading={loading}
++                disabled={!question.trim()}
++                size="md"
++              >
++                {loading ? "Asking…" : "Ask"}
++              </Button>
++            </div>
++          </form>
++
++          {/* Error */}
++          {error && (
++            <Card variant="error" className="mb-8 animate-fade-in">
++              <p role="alert" data-testid="error" className="text-red-700 dark:text-red-400 text-sm">
++                {error}
++              </p>
++            </Card>
++          )}
++
++          {/* Empty state */}
++          {!loading && !result && !error && (
++            <div className="text-center py-20 text-warm-gray dark:text-warm-gray-light animate-fade-in">
++              <p className="text-5xl mb-4" aria-hidden="true">🍜</p>
++              <p className="font-display text-lg font-semibold text-charcoal/50 dark:text-cream/40">
++                Your answer will appear here
++              </p>
++            </div>
++          )}
++
++          {/* Loading skeleton */}
++          {loading && (
++            <div className="animate-pulse space-y-4" aria-busy="true" aria-label="Loading answer">
++              <div className="h-4 bg-warm-gray/20 rounded w-3/4" />
++              <div className="h-4 bg-warm-gray/20 rounded w-full" />
++              <div className="h-4 bg-warm-gray/20 rounded w-5/6" />
++              <div className="h-4 bg-warm-gray/20 rounded w-2/3" />
++            </div>
++          )}
++
++          {/* Result */}
++          {result && (
++            <article className="space-y-6 animate-slide-up">
++
++              {/* Answer */}
++              <Card variant="highlight">
++                <h2 className="text-xs font-mono font-bold text-warm-gray dark:text-warm-gray-light uppercase tracking-widest mb-3">
++                  Answer
++                </h2>
++                <p
++                  data-testid="rag-answer"
++                  className="text-charcoal dark:text-cream leading-relaxed"
++                >
++                  {result.answer}
++                  {result.citations.length > 0 && (
++                    <span className="ml-2 inline-flex gap-1">
++                      {result.citations.map((c, i) => (
++                        <CitationBadge key={c.chunk_id} citation={c} index={i} />
++                      ))}
++                    </span>
++                  )}
++                </p>
++              </Card>
++
++              {/* Confidence */}
++              <Card>
++                <ConfidenceIndicator value={result.confidence} />
++              </Card>
++
++              {/* Citations */}
++              {result.citations.length > 0 && (
++                <Card>
++                  <h2 className="text-xs font-mono font-bold text-warm-gray dark:text-warm-gray-light uppercase tracking-widest mb-4">
++                    Citations ({result.citations.length})
++                  </h2>
++                  <ul className="space-y-3 list-none p-0">
++                    {result.citations.map((c, i) => (
++                      <li
++                        key={c.chunk_id}
++                        className="flex items-start gap-3 text-sm"
++                      >
++                        <CitationBadge citation={c} index={i} />
++                        <span className="text-warm-gray dark:text-warm-gray-light font-mono pt-0.5">
++                          Chunk <strong className="text-charcoal dark:text-cream">#{c.chunk_id}</strong>
++                          {" · "}score{" "}
++                          <strong className="text-charcoal dark:text-cream">{c.score.toFixed(3)}</strong>
++                        </span>
++                      </li>
++                    ))}
++                  </ul>
++                </Card>
++              )}
++
++              {result.citations.length === 0 && (
++                <p className="text-sm text-warm-gray dark:text-warm-gray-light italic">
++                  No citations were retrieved for this answer.
++                </p>
++              )}
++            </article>
++          )}
++        </main>
++      </div>
++    </>
+   );
+ }
+diff --git a/web/styles/globals.css b/web/styles/globals.css
+index 0774b2b..4f68255 100644
+--- a/web/styles/globals.css
++++ b/web/styles/globals.css
+@@ -1,6 +1,38 @@
+-html, body { font-family: system-ui, sans-serif; padding: 1.5rem; max-width: 720px; }
+-input, textarea { width: 100%; padding: 0.5rem; margin: 0.5rem 0; }
+-button { padding: 0.5rem 1rem; }
+-table { border-collapse: collapse; width: 100%; }
+-th, td { border: 1px solid #ddd; padding: 0.5rem; text-align: left; }
+-.entity-span { background: #ffd; padding: 0 0.2rem; border-radius: 3px; }
++@tailwind base;
++@tailwind components;
++@tailwind utilities;
++
++@layer base {
++  html {
++    @apply scroll-smooth;
++  }
++
++  body {
++    @apply bg-cream text-charcoal font-body antialiased;
++  }
++
++  @media (prefers-color-scheme: dark) {
++    body {
++      @apply bg-charcoal text-cream;
++    }
++  }
++}
++
++@layer utilities {
++  .animate-fade-in {
++    animation: fadeIn 0.3s ease-out both;
++  }
++
++  .animate-slide-up {
++    animation: slideUp 0.3s ease-out both;
++  }
++}
++
++@media (prefers-reduced-motion: reduce) {
++  *,
++  *::before,
++  *::after {
++    animation-duration: 0.01ms !important;
++    transition-duration: 0.01ms !important;
++  }
++}
