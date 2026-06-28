@@ -24,6 +24,23 @@ Answer:"""
 SENTINEL = "I cannot answer this from the available sources"
 CITATION_PATTERN = re.compile(r"\[(\d+)\]")
 GENERATOR_TIMEOUT_SECONDS = float(os.environ.get("RAG_GENERATOR_TIMEOUT_SECONDS", "30"))
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "do",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "of",
+    "the",
+    "to",
+}
 
 _generator_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rag-generator")
 
@@ -58,32 +75,106 @@ def extract_citations(answer: str, numbered: dict[int, dict]) -> list[dict]:
     return cited
 
 
+def _vector_score(chunk: dict) -> float:
+    distance = chunk.get("_additional", {}).get("distance")
+    if distance is None:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - float(distance)))
+
+
+def _bm25_score(chunk: dict) -> float:
+    raw_score = float(chunk.get("_additional", {}).get("score", 0.0))
+    if raw_score <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, raw_score / (raw_score + 1.0)))
+
+
+def _chunk_from_weaviate(chunk: dict, score: float) -> dict:
+    return {
+        "chunk_id": chunk["chunk_id"],
+        "text": chunk["text"],
+        "score": score,
+    }
+
+
+def _extract_chunks(raw_query: dict, score_fn) -> list[dict]:
+    return [
+        _chunk_from_weaviate(chunk, score_fn(chunk))
+        for chunk in raw_query["data"]["Get"]["Chunk"]
+    ]
+
+
+def _query_vector_chunks(question: str, embedder, weaviate_client, k: int) -> list[dict]:
+    vector = embedder.encode(question).tolist()
+    raw_query = (
+        weaviate_client.query.get("Chunk", ["chunk_id", "text"])
+        .with_near_vector({"vector": vector})
+        .with_limit(k)
+        .with_additional(["distance"])
+        .do()
+    )
+    return _extract_chunks(raw_query, _vector_score)
+
+
+def _query_bm25_chunks(question: str, weaviate_client, k: int) -> list[dict]:
+    raw_query = (
+        weaviate_client.query.get("Chunk", ["chunk_id", "text"])
+        .with_bm25(query=question)
+        .with_limit(k)
+        .with_additional(["score"])
+        .do()
+    )
+    return _extract_chunks(raw_query, _bm25_score)
+
+
+def _query_lexical_chunks(question: str, weaviate_client, k: int) -> list[dict]:
+    terms = set(re.findall(r"[a-z0-9]+", question.lower())) - STOPWORDS
+    if not terms:
+        return []
+
+    raw_query = (
+        weaviate_client.query.get("Chunk", ["chunk_id", "text"])
+        .with_limit(100)
+        .do()
+    )
+    chunks = raw_query["data"]["Get"]["Chunk"]
+    ranked = []
+    for chunk in chunks:
+        text_terms = set(re.findall(r"[a-z0-9]+", chunk["text"].lower()))
+        overlap = len(terms & text_terms)
+        if overlap:
+            score = overlap / len(terms)
+            ranked.append(_chunk_from_weaviate(chunk, max(0.0, min(1.0, score))))
+
+    return sorted(ranked, key=lambda c: c["score"], reverse=True)[:k]
+
+
+def retrieve_chunks(question: str, embedder, weaviate_client, k: int) -> list[dict]:
+    try:
+        retrieved = _query_vector_chunks(question, embedder, weaviate_client, k)
+    except Exception as e:
+        raise RuntimeError(f"Weaviate vector retrieval failed: {e.__class__.__name__}: {str(e)}") from e
+
+    if retrieved:
+        return retrieved
+
+    try:
+        retrieved = _query_bm25_chunks(question, weaviate_client, k)
+    except Exception as e:
+        raise RuntimeError(f"Weaviate BM25 retrieval failed: {e.__class__.__name__}: {str(e)}") from e
+
+    if retrieved:
+        return retrieved
+
+    try:
+        return _query_lexical_chunks(question, weaviate_client, k)
+    except Exception as e:
+        raise RuntimeError(f"Weaviate lexical retrieval failed: {e.__class__.__name__}: {str(e)}") from e
+
+
 def compose_rag(question: str, embedder, weaviate_client, generator, k: int = 4) -> dict:
     try:
-        vector = embedder.encode(question).tolist()
-    except Exception as e:
-        raise RuntimeError(f"Encoding failed: {e.__class__.__name__}: {str(e)}") from e
-
-    try:
-        raw_query = (
-            weaviate_client.query.get("Chunk", ["chunk_id", "text"])
-            .with_near_vector({"vector": vector})
-            .with_limit(k)
-            .with_additional(["distance"])
-            .do()
-        )
-    except Exception as e:
-        raise RuntimeError(f"Weaviate retrieval failed: {e.__class__.__name__}: {str(e)}") from e
-
-    try:
-        retrieved = [
-            {
-                "chunk_id": c["chunk_id"],
-                "text": c["text"],
-                "score": 1.0 - c["_additional"]["distance"],
-            }
-            for c in raw_query["data"]["Get"]["Chunk"]
-        ]
+        retrieved = retrieve_chunks(question, embedder, weaviate_client, k)
     except (KeyError, TypeError, IndexError) as e:
         raise RuntimeError(f"Malformed retrieval response: {e.__class__.__name__}") from e
 
@@ -113,6 +204,9 @@ def compose_rag(question: str, embedder, weaviate_client, generator, k: int = 4)
 
     clean_answer = raw.strip()
 
+    if SENTINEL.lower() in clean_answer.lower():
+        clean_answer = ""
+
     citation_only = re.fullmatch(r"\s*\[(\d+)\]\.?\s*", clean_answer)
     if citation_only:
         idx = int(citation_only.group(1))
@@ -121,13 +215,11 @@ def compose_rag(question: str, embedder, weaviate_client, generator, k: int = 4)
 
     citations = extract_citations(clean_answer, numbered)
 
-    # Fallback: if the generator did not produce a usable citation,
-    # return the top retrieved chunk with a grounded citation.
     if not citations:
-        first_idx = 1
-        first_chunk = numbered[first_idx]
-        clean_answer = f"{first_chunk['text']} [{first_idx}]"
-        citations = extract_citations(clean_answer, numbered)
+        best_idx = 1
+        best_chunk = numbered[best_idx]
+        clean_answer = f"{best_chunk['text']} [{best_idx}]"
+        citations = [{"chunk_id": best_chunk["chunk_id"], "score": best_chunk["score"]}]
 
     try:
         confidence = sum(c["score"] for c in citations) / len(citations)
